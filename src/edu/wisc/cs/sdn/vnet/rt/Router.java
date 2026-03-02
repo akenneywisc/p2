@@ -3,6 +3,8 @@ package edu.wisc.cs.sdn.vnet.rt;
 import edu.wisc.cs.sdn.vnet.Device;
 import edu.wisc.cs.sdn.vnet.DumpFile;
 import edu.wisc.cs.sdn.vnet.Iface;
+import net.floodlightcontroller.packet.IPv4;
+import java.util.Map;
 
 import net.floodlightcontroller.packet.Ethernet;
 
@@ -87,5 +89,43 @@ public class Router extends Device
 		
 		
 		/********************************************************************/
+		short type = etherPacket.getEtherType();
+		if (etherPacket.getEtherType() != Ethernet.TYPE_IPv4) return;
+		IPv4 pkt = (IPv4) etherPacket.getPayload();
+		byte ttl = pkt.getTtl();
+		ttl--;
+		pkt.setTtl(ttl);
+
+		int destinationAddress = pkt.getDestinationAddress();
+		int headerLengthBytes = 4 * pkt.getHeaderLength();
+		
+		short checksum = pkt.getChecksum();
+		pkt.setChecksum((short)0);
+
+		pkt.serialize();
+
+		short computedChecksum = pkt.getChecksum();
+		if (computedChecksum != checksum) return;
+
+		if (pkt.getTtl() <= 0) return;
+		Map<String,Iface> interfaces = this.interfaces;
+
+		for (Iface iface : this.interfaces.values()) {
+			if (pkt.getDestinationAddress() == iface.getIpAddress()) return;
+		}
+
+		RouteEntry match = this.routeTable.lookup(destinationAddress);
+		if (match == null) return;
+		int nextHop = match.getGatewayAddress();
+
+		ArpEntry arp = this.arpCache.lookup(nextHop);
+
+		Iface outIface = match.getInterface();
+
+		etherPacket.setSourceMACAddress(outIface.getMacAddress().toBytes());
+		etherPacket.setDestinationMACAddress(arp.getMac().toBytes());
+
+		this.sendPacket(etherPacket, outIface);
+		
 	}
 }
