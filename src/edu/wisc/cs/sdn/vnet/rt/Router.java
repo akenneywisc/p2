@@ -92,9 +92,6 @@ public class Router extends Device
 		short type = etherPacket.getEtherType();
 		if (etherPacket.getEtherType() != Ethernet.TYPE_IPv4) return;
 		IPv4 pkt = (IPv4) etherPacket.getPayload();
-		byte ttl = pkt.getTtl();
-		ttl--;
-		pkt.setTtl(ttl);
 
 		int destinationAddress = pkt.getDestinationAddress();
 		int headerLengthBytes = 4 * pkt.getHeaderLength();
@@ -107,7 +104,12 @@ public class Router extends Device
 		short computedChecksum = pkt.getChecksum();
 		if (computedChecksum != checksum) return;
 
-		if (pkt.getTtl() <= 0) return;
+		byte ttl = pkt.getTtl();
+		ttl--;
+		pkt.setTtl(ttl);
+		pkt.resetChecksum();
+		pkt.serialize();
+		if (ttl & 0xFF) == 0 return;
 		Map<String,Iface> interfaces = this.interfaces;
 
 		for (Iface iface : this.interfaces.values()) {
@@ -117,8 +119,10 @@ public class Router extends Device
 		RouteEntry match = this.routeTable.lookup(destinationAddress);
 		if (match == null) return;
 		int nextHop = match.getGatewayAddress();
+		if (nextHop == 0) nextHop = destinationAddress;
 
 		ArpEntry arp = this.arpCache.lookup(nextHop);
+		if (arp == null) return;
 
 		Iface outIface = match.getInterface();
 
