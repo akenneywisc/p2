@@ -109,7 +109,7 @@ public class Router extends Device
 		pkt.setTtl(ttl);
 		pkt.resetChecksum();
 		pkt.serialize();
-		if (ttl & 0xFF) == 0 return;
+		if ((ttl & 0xFF)==0) return;
 		Map<String,Iface> interfaces = this.interfaces;
 
 		for (Iface iface : this.interfaces.values()) {
