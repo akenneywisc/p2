@@ -7,6 +7,7 @@ import net.floodlightcontroller.packet.IPv4;
 import java.util.Map;
 
 import net.floodlightcontroller.packet.Ethernet;
+import java.util.concurrent.*;
 
 /**
  * @author Aaron Gember-Jacobson and Anubhavnidhi Abhashkumar
@@ -35,6 +36,24 @@ public class Router extends Device
 	 */
 	public RouteTable getRouteTable()
 	{ return this.routeTable; }
+
+
+	public void startRIP(){
+
+		for (Iface iface : this.interfaces.values()) {
+			int ip = iface.getIpAddress();
+			int mask = iface.getSubnetMask();
+			int network = ip & mask;
+			this.routeTable.insert(network, 0, mask, iface);
+		}
+
+		
+		ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(1);
+		scheduler.scheduleAtFixedRate(() -> {
+			System.out.println("Running RIP update...");
+			System.out.println(this.routeTable);
+		}, 0, 10, TimeUnit.SECONDS);
+	}
 	
 	/**
 	 * Load a new routing table from a file.
@@ -112,12 +131,17 @@ public class Router extends Device
 		if ((ttl & 0xFF)==0) return;
 		Map<String,Iface> interfaces = this.interfaces;
 
+
 		for (Iface iface : this.interfaces.values()) {
 			if (pkt.getDestinationAddress() == iface.getIpAddress()) return;
 		}
 
 		RouteEntry match = this.routeTable.lookup(destinationAddress);
 		if (match == null) return;
+
+		if (match.getInterface() == inIface)
+		{ return; }
+
 		int nextHop = match.getGatewayAddress();
 		if (nextHop == 0) nextHop = destinationAddress;
 

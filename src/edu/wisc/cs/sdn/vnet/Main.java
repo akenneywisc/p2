@@ -92,7 +92,13 @@ public class Main
 			// Read static ACP cache
 			if (arpCacheFile != null)
 			{ ((Router)dev).loadArpCache(arpCacheFile); }
+
+			if (routeTableFile == null){
+				 ((Router)dev).startRIP();
+			}
+
 		}
+
 
 		// Read messages from the server until the server closes the connection
 		System.out.println("<-- Ready to process packets -->");
