@@ -154,11 +154,20 @@ public class RouteTable
 	}
 	
 	/**
+	 * Returns a snapshot of all route entries.
+	 */
+	public List<RouteEntry> getEntries()
+	{
+		synchronized(this.entries)
+		{ return new LinkedList<RouteEntry>(this.entries); }
+	}
+
+	/**
 	 * Add an entry to the route table.
 	 * @param dstIp destination IP
 	 * @param gwIp gateway IP
 	 * @param maskIp subnet mask
-	 * @param iface router interface out which to send packets to reach the 
+	 * @param iface router interface out which to send packets to reach the
 	 *		destination or gateway
 	 */
 	public void insert(int dstIp, int gwIp, int maskIp, Iface iface)
