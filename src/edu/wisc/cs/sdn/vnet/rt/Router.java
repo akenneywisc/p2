@@ -3,7 +3,6 @@ package edu.wisc.cs.sdn.vnet.rt;
 import edu.wisc.cs.sdn.vnet.Device;
 import edu.wisc.cs.sdn.vnet.DumpFile;
 import edu.wisc.cs.sdn.vnet.Iface;
-import java.util.HashMap;
 import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
@@ -27,9 +26,9 @@ public class Router extends Device
 	private ArpCache arpCache;
 
 	/** RIP metrics keyed by "dstIp/maskIp" */
-	private Map<String, Integer> ripMetrics     = new HashMap<>();
+	private Map<String, Integer> ripMetrics     = new ConcurrentHashMap<>();
 	/** RIP last-updated timestamps keyed by "dstIp/maskIp" */
-	private Map<String, Long>    ripTimestamps  = new HashMap<>();
+	private Map<String, Long>    ripTimestamps  = new ConcurrentHashMap<>();
 
 	private static final int  RIP_MULTICAST_IP = IPv4.toIPv4Address("224.0.0.9");
 	private static final MACAddress RIP_BROADCAST_MAC =
@@ -191,7 +190,7 @@ public class Router extends Device
 					ripMetrics.put(key, newMetric);
 					ripTimestamps.put(key, System.currentTimeMillis());
 				} else {
-					// Same or worse metric — but if it's the same next-hop refresh
+					// Same or worse metric — if same next-hop, update metric and refresh
 					RouteEntry existing = null;
 					for (RouteEntry e : this.routeTable.getEntries()) {
 						if (e.getDestinationAddress() == network
@@ -201,12 +200,18 @@ public class Router extends Device
 						}
 					}
 					if (existing != null && existing.getGatewayAddress() == srcIp) {
+						ripMetrics.put(key, newMetric);
 						ripTimestamps.put(key, System.currentTimeMillis());
 					}
 				}
 			}
 		}
 	}
+	
+	/**
+	 * Load a new routing table from a file.
+	 * @param routeTableFile the name of the file containing the routing table
+	 */
 	public void loadRouteTable(String routeTableFile)
 	{
 		if (!routeTable.load(routeTableFile, this))
