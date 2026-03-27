@@ -25,17 +25,14 @@ public class Router extends Device
 	/** ARP cache for the router */
 	private ArpCache arpCache;
 
-	/** RIP metrics keyed by "dstIp/maskIp" */
-	private Map<String, Integer> ripMetrics     = new ConcurrentHashMap<>();
-	/** RIP last-updated timestamps keyed by "dstIp/maskIp" */
-	private Map<String, Long>    ripTimestamps  = new ConcurrentHashMap<>();
+	private Map<String, Integer> ripMetrics = new ConcurrentHashMap<>();
+	private Map<String, Long>    ripTimestamps = new ConcurrentHashMap<>();
 
 	private static final int  RIP_MULTICAST_IP = IPv4.toIPv4Address("224.0.0.9");
-	private static final MACAddress RIP_BROADCAST_MAC =
-			MACAddress.valueOf("FF:FF:FF:FF:FF:FF");
-	private static final int  RIP_INFINITY      = 16;
-	private static final long RIP_TIMEOUT_MS    = 30000; // 30 seconds
-	private static final int  RIP_UPDATE_SECS   = 10;
+	private static final MACAddress RIP_BROADCAST_MAC = MACAddress.valueOf("FF:FF:FF:FF:FF:FF");
+	private static final int  RIP_INFINITY = 16;
+	private static final long RIP_TIMEOUT_MS = 30000;
+	private static final int  RIP_UPDATE_SECS = 10;
 
 	/**
 	 * Creates a router for a specific host.
@@ -55,27 +52,26 @@ public class Router extends Device
 	{ return this.routeTable; }
 
 
-	private static String ripKey(int dstIp, int maskIp)
+	private static String createRIPKey(int dstIp, int maskIp)
 	{ return dstIp + "/" + maskIp; }
 
 	public void startRIP(){
-
+		// take input, make into RIP requests, track RIPs
 		for (Iface iface : this.interfaces.values()) {
 			int network = iface.getIpAddress() & iface.getSubnetMask();
 			this.routeTable.insert(network, 0, iface.getSubnetMask(), iface);
-			String key = ripKey(network, iface.getSubnetMask());
+			String key = createRIPKey(network, iface.getSubnetMask());
 			ripMetrics.put(key, 1);
-			// directly-connected routes never time out; no timestamp needed
 		}
 
-		// Send an initial RIP request out every interface
+		// Send RIP for each interface value
 		for (Iface iface : this.interfaces.values()) {
 			sendRipRequest(iface);
 		}
 
 		
-		ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(1);
-		scheduler.scheduleAtFixedRate(() -> {
+		ScheduledExecutorService timer = Executors.newScheduledThreadPool(1);
+		timer.scheduleAtFixedRate(() -> {
 			removeTimedOutEntries();
 			sendUnsolicitedRipResponse();
 		}, RIP_UPDATE_SECS, RIP_UPDATE_SECS, TimeUnit.SECONDS);
@@ -84,18 +80,19 @@ public class Router extends Device
 	private void removeTimedOutEntries()
 	{
 		long now = System.currentTimeMillis();
-		List<RouteEntry> toRemove = new LinkedList<>();
+		List<RouteEntry> expiredList = new LinkedList<>();
 		for (RouteEntry entry : this.routeTable.getEntries()) {
-			// Skip directly-connected routes (gateway == 0)
+			// Skip directly-connected routes not rip
 			if (entry.getGatewayAddress() == 0) { continue; }
-			String key = ripKey(entry.getDestinationAddress(), entry.getMaskAddress());
-			Long ts = ripTimestamps.get(key);
-			if (ts != null && now - ts > RIP_TIMEOUT_MS) {
-				toRemove.add(entry);
+			String key = createRIPKey(entry.getDestinationAddress(), entry.getMaskAddress());
+			Long timestamp = ripTimestamps.get(key);
+			if (timestamp != null && now - timestamp > RIP_TIMEOUT_MS) {
+				expiredList.add(entry);
 			}
 		}
-		for (RouteEntry entry : toRemove) {
-			String key = ripKey(entry.getDestinationAddress(), entry.getMaskAddress());
+		// clean in context lists
+		for (RouteEntry entry : expiredList) {
+			String key = createRIPKey(entry.getDestinationAddress(), entry.getMaskAddress());
 			this.routeTable.remove(entry.getDestinationAddress(), entry.getMaskAddress());
 			ripMetrics.remove(key);
 			ripTimestamps.remove(key);
@@ -116,19 +113,19 @@ public class Router extends Device
 		ip.setTtl((byte) 64);
 		ip.setPayload(udp);
 
-		Ethernet eth = new Ethernet();
-		eth.setEtherType(Ethernet.TYPE_IPv4);
-		eth.setSourceMACAddress(outIface.getMacAddress().toBytes());
-		eth.setDestinationMACAddress(destMac.toBytes());
-		eth.setPayload(ip);
+		Ethernet ethernet = new Ethernet();
+		ethernet.setEtherType(Ethernet.TYPE_IPv4);
+		ethernet.setSourceMACAddress(outIface.getMacAddress().toBytes());
+		ethernet.setDestinationMACAddress(destMac.toBytes());
+		ethernet.setPayload(ip);
 
-		this.sendPacket(eth, outIface);
+		this.sendPacket(ethernet, outIface);
 	}
 
 	private void sendRipRequest(Iface iface)
 	{
 		RIPv2 rip = new RIPv2();
-		rip.setCommand(RIPv2.COMMAND_REQUEST);
+		rip.setCommand(RIPv2.COMMAND_REQUEST); 
 		sendRipPacket(rip, iface, RIP_MULTICAST_IP, RIP_BROADCAST_MAC);
 	}
 
@@ -144,12 +141,9 @@ public class Router extends Device
 		RIPv2 rip = new RIPv2();
 		rip.setCommand(RIPv2.COMMAND_RESPONSE);
 		for (RouteEntry entry : this.routeTable.getEntries()) {
-			String key = ripKey(entry.getDestinationAddress(), entry.getMaskAddress());
+			String key = createRIPKey(entry.getDestinationAddress(), entry.getMaskAddress());
 			int metric = ripMetrics.getOrDefault(key, RIP_INFINITY);
-			RIPv2Entry ripEntry = new RIPv2Entry(
-					entry.getDestinationAddress(),
-					entry.getMaskAddress(),
-					metric);
+			RIPv2Entry ripEntry = new RIPv2Entry( entry.getDestinationAddress(), entry.getMaskAddress(), metric);
 			rip.addEntry(ripEntry);
 		}
 		sendRipPacket(rip, outIface, destIp, destMac);
@@ -160,9 +154,8 @@ public class Router extends Device
 		UDP udp = (UDP) ipPacket.getPayload();
 		if (!(udp.getPayload() instanceof RIPv2)) { return; }
 		RIPv2 rip = (RIPv2) udp.getPayload();
-
+		// send message back to router
 		if (rip.getCommand() == RIPv2.COMMAND_REQUEST) {
-			// Unicast response back to the requesting router
 			int srcIp = ipPacket.getSourceAddress();
 			MACAddress srcMac = MACAddress.valueOf(etherPacket.getSourceMACAddress());
 			sendRipResponse(inIface, srcIp, srcMac);
@@ -173,34 +166,33 @@ public class Router extends Device
 			for (RIPv2Entry ripEntry : rip.getEntries()) {
 				int network   = ripEntry.getAddress();
 				int mask      = ripEntry.getSubnetMask();
-				int newMetric = ripEntry.getMetric() + 1;
+				int updatedMetric = ripEntry.getMetric() + 1;
 
-				if (newMetric >= RIP_INFINITY) { continue; }
-
-				String key = ripKey(network, mask);
+				if (updatedMetric >= RIP_INFINITY) { continue; }
+				String key = createRIPKey(network, mask);
 				Integer existingMetric = ripMetrics.get(key);
 
 				if (existingMetric == null) {
-					// New destination
+					// Undiscovered destination
 					this.routeTable.insert(network, srcIp, mask, inIface);
-					ripMetrics.put(key, newMetric);
+					ripMetrics.put(key, updatedMetric);
 					ripTimestamps.put(key, System.currentTimeMillis());
-				} else if (newMetric < existingMetric) {
+				} else if (updatedMetric < existingMetric) {
 					this.routeTable.update(network, mask, srcIp, inIface);
-					ripMetrics.put(key, newMetric);
+					ripMetrics.put(key, updatedMetric);
 					ripTimestamps.put(key, System.currentTimeMillis());
 				} else {
-					// Same or worse metric — if same next-hop, update metric and refresh
+					// Same or worse metric value
 					RouteEntry existing = null;
 					for (RouteEntry e : this.routeTable.getEntries()) {
-						if (e.getDestinationAddress() == network
-								&& e.getMaskAddress() == mask) {
+						if (e.getDestinationAddress() == network && e.getMaskAddress() == mask) {
 							existing = e;
 							break;
 						}
 					}
+					// entry is valud for search
 					if (existing != null && existing.getGatewayAddress() == srcIp) {
-						ripMetrics.put(key, newMetric);
+						ripMetrics.put(key, updatedMetric);
 						ripTimestamps.put(key, System.currentTimeMillis());
 					}
 				}
