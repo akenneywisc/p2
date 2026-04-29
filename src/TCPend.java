@@ -3,6 +3,7 @@ import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.file.*;
 import java.util.*;
+import java.io.*;
 
 public class TCPend {
 
@@ -155,113 +156,179 @@ public class TCPend {
         return new Object[]{senderAddr, senderPort};
     }
 
+    static void senderTeardown(DatagramSocket socket, InetAddress remoteAddr, int remotePort,
+                            int mtu, int finSeq) throws Exception {
+        int retries = 0;
+
+        while (true) {
+            TCPSegment fin = new TCPSegment();
+            fin.seqNum = finSeq;
+            fin.ackNum = 1;
+            fin.ackFlag = true;
+            fin.finFlag = true;
+            fin.timestamp = System.nanoTime();
+
+            sendSegment(socket, fin, remoteAddr, remotePort);
+
+            try {
+                while (true) {
+                    byte[] buf = new byte[24 + mtu];
+                    DatagramPacket dp = new DatagramPacket(buf, buf.length);
+                    socket.receive(dp);
+
+                    byte[] recv = Arrays.copyOf(dp.getData(), dp.getLength());
+
+                    if (!checkCheckSum(recv)) {
+                        checksumDiscards++;
+                        continue;
+                    }
+
+                    TCPSegment seg = TCPSegment.decompose(recv);
+
+                    logPacket("rcv", seg.synFlag, seg.ackFlag, seg.finFlag,
+                            seg.dataLen, seg.seqNum, seg.ackNum, startTime);
+                    packetCount++;
+
+                    if (seg.ackFlag && seg.finFlag && seg.ackNum == finSeq + 1) {
+                        TCPSegment finalAck = new TCPSegment();
+                        finalAck.seqNum = finSeq + 1;
+                        finalAck.ackNum = seg.seqNum + 1;
+                        finalAck.ackFlag = true;
+                        finalAck.timestamp = seg.timestamp;
+
+                        sendSegment(socket, finalAck, remoteAddr, remotePort);
+                        printStats();
+                        return;
+                    }
+                }
+            } catch (SocketTimeoutException e) {
+                retries++;
+                retransmissions++;
+
+                if (retries > 16) {
+                    System.err.println("FIN retransmit limit exceeded");
+                    printStats();
+                    return;
+                }
+            }
+        }
+    }
+
     static void runSender(DatagramSocket socket, InetAddress remoteAddr, int remotePort,
                           String filename, int mtu, int sws) throws Exception {
         long[] ewmaState = senderHandshake(socket, remoteAddr, remotePort, mtu);
-        long estimatedRTT       = ewmaState[0];
-        long estimatedDeviation = ewmaState[1];
-        long timeoutNs          = ewmaState[2];
 
-        byte[] fileData = Files.readAllBytes(Paths.get(filename));
+        byte[] fileBytes = java.nio.file.Files.readAllBytes(java.nio.file.Paths.get(filename));
+        dataBytes = fileBytes.length;
 
-        int base = 1, nextSeq = 1;
-        TreeMap<Integer, TCPSegment> unAcked          = new TreeMap<>();
-        HashMap<Integer, Integer>   retryCount        = new HashMap<>();
-        HashSet<Integer>            retransmittedSeqs = new HashSet<>();
-        int lastAckNum = 1, dupAckCount = 0;
-        boolean eof = (fileData.length == 0);
+        ArrayList<TCPSegment> packets = new ArrayList<>();
 
-        while (!eof || !unAcked.isEmpty()) {
+        int seq = 1; // after SYN, first data byte starts at seq 1
 
-            while (unAcked.size() < sws && !eof) {
-                int offset = nextSeq - 1;
-                if (offset >= fileData.length) { eof = true; break; }
-                int chunkLen = Math.min(mtu, fileData.length - offset);
-                byte[] chunk = Arrays.copyOfRange(fileData, offset, offset + chunkLen);
+        for (int offset = 0; offset < fileBytes.length; offset += mtu) {
+            int len = Math.min(mtu, fileBytes.length - offset);
 
-                TCPSegment seg = new TCPSegment();
-                seg.seqNum    = nextSeq;
-                seg.ackNum    = 1;
-                seg.ackFlag   = true;
-                seg.data      = chunk;
-                seg.dataLen   = chunkLen;
+            TCPSegment seg = new TCPSegment();
+            seg.seqNum = seq;
+            seg.ackNum = 1;
+            seg.ackFlag = true;     // assignment says data after handshake should ACK
+            seg.dataLen = len;
+            seg.data = Arrays.copyOfRange(fileBytes, offset, offset + len);
+            seg.timestamp = System.nanoTime();
+
+            packets.add(seg);
+            seq += len;
+        }
+
+        int base = 0;       // first unACKed packet index
+        int next = 0;       // next packet index to send
+        int lastAck = 1;
+        int duplicateAckCount = 0;
+
+        while (base < packets.size()) {
+            // Send new packets while window has space
+            while (next < packets.size() && next < base + sws) {
+                TCPSegment seg = packets.get(next);
                 seg.timestamp = System.nanoTime();
-
                 sendSegment(socket, seg, remoteAddr, remotePort);
-                unAcked.put(nextSeq, seg);
-                retryCount.put(nextSeq, 0);
-                dataBytes += chunkLen;
-                nextSeq   += chunkLen;
-                if (nextSeq - 1 >= fileData.length) eof = true;
+                next++;
             }
 
-            if (unAcked.isEmpty()) continue;
-
-            socket.setSoTimeout(Math.max(1, (int) (timeoutNs / 1_000_000)));
             try {
                 byte[] buf = new byte[24 + mtu];
                 DatagramPacket dp = new DatagramPacket(buf, buf.length);
                 socket.receive(dp);
+
                 byte[] recv = Arrays.copyOf(dp.getData(), dp.getLength());
-                if (!checkCheckSum(recv)) { checksumDiscards++; continue; }
 
-                TCPSegment seg = TCPSegment.decompose(recv);
-                logPacket("rcv", seg.synFlag, seg.ackFlag, seg.finFlag,
-                        seg.dataLen, seg.seqNum, seg.ackNum, startTime);
+                if (!checkCheckSum(recv)) {
+                    checksumDiscards++;
+                    continue;
+                }
 
-                int ackNum = seg.ackNum;
+                TCPSegment ackSeg = TCPSegment.decompose(recv);
 
-                if (ackNum == lastAckNum) {
-                    dupAckCount++;
-                    dupAcks++;
-                    if (dupAckCount == 3) {
-                        TCPSegment toRetransmit = unAcked.get(base);
-                        if (toRetransmit != null) {
-                            toRetransmit.timestamp = System.nanoTime();
-                            sendSegment(socket, toRetransmit, remoteAddr, remotePort);
-                            retransmissions++;
-                            retransmittedSeqs.add(base);
+                logPacket("rcv", ackSeg.synFlag, ackSeg.ackFlag, ackSeg.finFlag,
+                        ackSeg.dataLen, ackSeg.seqNum, ackSeg.ackNum, startTime);
+                packetCount++;
+
+                if (!ackSeg.ackFlag) {
+                    continue;
+                }
+
+                int ackNum = ackSeg.ackNum;
+
+                // New ACK: slide base forward past all fully ACKed packets
+                if (ackNum > lastAck) {
+                    lastAck = ackNum;
+                    duplicateAckCount = 0;
+
+                    while (base < packets.size()) {
+                        TCPSegment first = packets.get(base);
+                        int firstEnd = first.seqNum + first.dataLen;
+
+                        if (firstEnd <= ackNum) {
+                            base++;
+                        } else {
+                            break;
                         }
-                        dupAckCount = 0;
                     }
-                } else if (ackNum > lastAckNum) {
-                    boolean wasRetransmitted = false;
-                    for (Integer seq : new ArrayList<>(unAcked.headMap(ackNum).keySet())) {
-                        if (retransmittedSeqs.remove(seq)) wasRetransmitted = true;
-                        unAcked.remove(seq);
-                        retryCount.remove(seq);
-                    }
-                    base        = ackNum;
-                    lastAckNum  = ackNum;
-                    dupAckCount = 0;
+                }
 
-                    if (!wasRetransmitted) {
-                        long sampledRTT       = System.nanoTime() - seg.timestamp;
-                        long sampledDeviation = Math.abs(sampledRTT - estimatedRTT);
-                        estimatedRTT        = (long) (0.875 * estimatedRTT       + 0.125 * sampledRTT);
-                        estimatedDeviation  = (long) (0.75  * estimatedDeviation + 0.25  * sampledDeviation);
-                        timeoutNs           = estimatedRTT + 4 * estimatedDeviation;
-                        socket.setSoTimeout(Math.max(1, (int) (timeoutNs / 1_000_000)));
+                // Duplicate ACK
+                else if (ackNum == lastAck) {
+                    duplicateAckCount++;
+                    dupAcks++;
+
+                    // Fast retransmit: after 3 duplicate ACKs
+                    if (duplicateAckCount >= 3) {
+                        retransmissions++;
+
+                        // Simple version: retransmit entire current window
+                        for (int i = base; i < next; i++) {
+                            TCPSegment seg = packets.get(i);
+                            seg.timestamp = System.nanoTime();
+                            sendSegment(socket, seg, remoteAddr, remotePort);
+                        }
+
+                        duplicateAckCount = 0;
                     }
                 }
 
             } catch (SocketTimeoutException e) {
-                if (unAcked.isEmpty()) continue;
-                retryCount.merge(base, 1, Integer::sum);
-                if (retryCount.get(base) > 16) {
-                    System.err.println("Retransmit limit exceeded for seq " + base);
-                    socket.close();
-                    System.exit(1);
-                }
-                TCPSegment toRetransmit = unAcked.get(base);
-                toRetransmit.timestamp = System.nanoTime();
-                sendSegment(socket, toRetransmit, remoteAddr, remotePort);
+                // Timeout: retransmit entire current window
                 retransmissions++;
-                retransmittedSeqs.add(base);
+
+                for (int i = base; i < next; i++) {
+                    TCPSegment seg = packets.get(i);
+                    seg.timestamp = System.nanoTime();
+                    sendSegment(socket, seg, remoteAddr, remotePort);
+                }
             }
         }
 
-        throw new UnsupportedOperationException("FIN teardown not yet implemented");
+        senderTeardown(socket, remoteAddr, remotePort, mtu, lastAck);        
+        printStats();
     }
 
     static void runReceiver(DatagramSocket socket, String filename,
@@ -269,9 +336,94 @@ public class TCPend {
         Object[] senderInfo = receiverHandshake(socket, mtu);
         InetAddress senderAddr = (InetAddress) senderInfo[0];
         int senderPort = (int) senderInfo[1];
+
         int expectedSeq = 1;
 
-        throw new UnsupportedOperationException("data path not yet implemented");
+        try (FileOutputStream fos = new FileOutputStream(filename)) {
+            while (true) {
+                byte[] buf = new byte[24 + mtu];
+                DatagramPacket dp = new DatagramPacket(buf, buf.length);
+                socket.receive(dp);
+
+                byte[] recv = Arrays.copyOf(dp.getData(), dp.getLength());
+
+                if (!checkCheckSum(recv)) {
+                    checksumDiscards++;
+                    continue;
+                }
+
+                TCPSegment seg = TCPSegment.decompose(recv);
+
+                logPacket("rcv", seg.synFlag, seg.ackFlag, seg.finFlag,
+                        seg.dataLen, seg.seqNum, seg.ackNum, startTime);
+                packetCount++;
+
+                // Handle FIN from sender
+                if (seg.finFlag) {
+                    TCPSegment finAck = new TCPSegment();
+                    finAck.seqNum = 1;
+                    finAck.ackNum = seg.seqNum + 1;
+                    finAck.ackFlag = true;
+                    finAck.finFlag = true;
+                    finAck.timestamp = seg.timestamp;
+
+                    sendSegment(socket, finAck, senderAddr, senderPort);
+
+                    // Wait for final ACK from sender
+                    while (true) {
+                        byte[] finalBuf = new byte[24 + mtu];
+                        DatagramPacket finalDp = new DatagramPacket(finalBuf, finalBuf.length);
+                        socket.receive(finalDp);
+
+                        byte[] finalRecv = Arrays.copyOf(finalDp.getData(), finalDp.getLength());
+
+                        if (!checkCheckSum(finalRecv)) {
+                            checksumDiscards++;
+                            continue;
+                        }
+
+                        TCPSegment finalAck = TCPSegment.decompose(finalRecv);
+
+                        logPacket("rcv", finalAck.synFlag, finalAck.ackFlag, finalAck.finFlag,
+                                finalAck.dataLen, finalAck.seqNum, finalAck.ackNum, startTime);
+                        packetCount++;
+
+                        if (finalAck.ackFlag && finalAck.ackNum == 2 && finalAck.seqNum == seg.seqNum + 1) {
+                            printStats();
+                            return;
+                        }
+                    }
+                }
+
+                // Ignore non-data packets here
+                if (seg.dataLen <= 0) {
+                    continue;
+                }
+
+                // Correct in-order packet
+                if (seg.seqNum == expectedSeq) {
+                    fos.write(seg.data);
+                    dataBytes += seg.dataLen;
+                    expectedSeq += seg.dataLen;
+                }
+
+                // Out-of-order packet
+                else {
+                    outOfSeq++;
+                    // We drop it and ACK the last contiguous byte received
+                }
+
+                // Send cumulative ACK
+                TCPSegment ack = new TCPSegment();
+                ack.seqNum = 1;
+                ack.ackNum = expectedSeq;
+                ack.ackFlag = true;
+                ack.timestamp = seg.timestamp; // echo received timestamp for RTT
+                ack.dataLen = 0;
+
+                sendSegment(socket, ack, senderAddr, senderPort);
+            }
+        }
     }
 
     public static void main(String[] args) throws Exception {
