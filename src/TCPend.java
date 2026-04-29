@@ -1,9 +1,11 @@
 import java.net.*;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
-import java.util.Arrays;
+import java.nio.file.*;
+import java.util.*;
 
 public class TCPend {
+
     static long dataBytes = 0;
     static long packetCount = 0;
     static long outOfSeq = 0;
@@ -24,13 +26,13 @@ public class TCPend {
                 seq, dataLen, ackNum);
     }
 
-    // Returns true if the packet's stored checksum matches
     static boolean checkCheckSum(byte[] bytes) {
         short stored = (short) (((bytes[22] & 0xFF) << 8) | (bytes[23] & 0xFF));
         return stored == TCPSegment.getChecksum(bytes);
     }
 
-    static void sendSegment(DatagramSocket socket, TCPSegment seg, InetAddress addr, int port) throws Exception {
+    static void sendSegment(DatagramSocket socket, TCPSegment seg,
+                            InetAddress addr, int port) throws Exception {
         byte[] bytes = seg.compose();
         socket.send(new DatagramPacket(bytes, bytes.length, addr, port));
         logPacket("snd", seg.synFlag, seg.ackFlag, seg.finFlag,
@@ -38,36 +40,33 @@ public class TCPend {
         packetCount++;
     }
 
-    static long[] senderHandshake(DatagramSocket socket, InetAddress remoteAddr, int remotePort, int mtu) throws Exception {
+    static long[] senderHandshake(DatagramSocket socket,
+                                   InetAddress remoteAddr, int remotePort,
+                                   int mtu) throws Exception {
         long timeoutNs = 5_000_000_000L;
         socket.setSoTimeout(5000);
-
         int synRetries = 0;
         long estimatedRTT = 0, estimatedDeviation = 0;
 
         outer:
         while (true) {
-            // Build and send SYN
             TCPSegment syn = new TCPSegment();
             syn.seqNum = 0;
             syn.synFlag = true;
             syn.timestamp = System.nanoTime();
             sendSegment(socket, syn, remoteAddr, remotePort);
 
-            // Wait for SYN+ACK
             while (true) {
                 try {
                     byte[] buf = new byte[24 + mtu];
                     DatagramPacket dp = new DatagramPacket(buf, buf.length);
                     socket.receive(dp);
                     byte[] recv = Arrays.copyOf(dp.getData(), dp.getLength());
-
                     if (!checkCheckSum(recv)) { checksumDiscards++; continue; }
 
                     TCPSegment seg = TCPSegment.decompose(recv);
                     logPacket("rcv", seg.synFlag, seg.ackFlag, seg.finFlag,
                             seg.dataLen, seg.seqNum, seg.ackNum, startTime);
-                    packetCount++;
 
                     if (seg.synFlag && seg.ackFlag && seg.ackNum == 1) {
                         estimatedRTT = System.nanoTime() - seg.timestamp;
@@ -104,24 +103,20 @@ public class TCPend {
         InetAddress senderAddr = null;
         int senderPort = -1;
 
-        // Wait for valid SYN
         while (true) {
             byte[] buf = new byte[24 + mtu];
             DatagramPacket dp = new DatagramPacket(buf, buf.length);
             socket.receive(dp);
             byte[] recv = Arrays.copyOf(dp.getData(), dp.getLength());
-
             if (!checkCheckSum(recv)) { checksumDiscards++; continue; }
 
             TCPSegment seg = TCPSegment.decompose(recv);
             if (seg.synFlag && seg.seqNum == 0) {
-                logPacket("rcv", true, seg.ackFlag, false,
-                        0, 0, seg.ackNum, startTime);
+                logPacket("rcv", true, seg.ackFlag, false, 0, 0, seg.ackNum, startTime);
                 packetCount++;
                 senderAddr = dp.getAddress();
                 senderPort = dp.getPort();
 
-                // Build SYN+ACK, echoing the SYN's timestamp
                 TCPSegment synAck = new TCPSegment();
                 synAck.seqNum = 0;
                 synAck.ackNum = 1;
@@ -129,36 +124,29 @@ public class TCPend {
                 synAck.ackFlag = true;
                 synAck.timestamp = seg.timestamp;
                 synAckBytes = synAck.compose();
-                socket.send(new DatagramPacket(synAckBytes, synAckBytes.length,
-                        senderAddr, senderPort));
+                socket.send(new DatagramPacket(synAckBytes, synAckBytes.length, senderAddr, senderPort));
                 logPacket("snd", true, true, false, 0, 0, 1, startTime);
                 packetCount++;
                 break;
             }
         }
 
-        // Wait for final ACK; re-send SYN+ACK on duplicate SYN
         while (true) {
             byte[] buf = new byte[24 + mtu];
             DatagramPacket dp = new DatagramPacket(buf, buf.length);
             socket.receive(dp);
             byte[] recv = Arrays.copyOf(dp.getData(), dp.getLength());
-
             if (!checkCheckSum(recv)) { checksumDiscards++; continue; }
 
             TCPSegment seg = TCPSegment.decompose(recv);
-
             if (seg.synFlag && seg.seqNum == 0) {
                 logPacket("rcv", true, seg.ackFlag, false, 0, 0, seg.ackNum, startTime);
-                socket.send(new DatagramPacket(synAckBytes, synAckBytes.length,
-                        senderAddr, senderPort));
+                socket.send(new DatagramPacket(synAckBytes, synAckBytes.length, senderAddr, senderPort));
                 logPacket("snd", true, true, false, 0, 0, 1, startTime);
                 continue;
             }
-
             if (seg.ackFlag && seg.ackNum == 1) {
-                logPacket("rcv", false, true, false,
-                        seg.dataLen, seg.seqNum, seg.ackNum, startTime);
+                logPacket("rcv", false, true, false, seg.dataLen, seg.seqNum, seg.ackNum, startTime);
                 packetCount++;
                 break;
             }
@@ -170,8 +158,110 @@ public class TCPend {
     static void runSender(DatagramSocket socket, InetAddress remoteAddr, int remotePort,
                           String filename, int mtu, int sws) throws Exception {
         long[] ewmaState = senderHandshake(socket, remoteAddr, remotePort, mtu);
-        // ewmaState = {estimatedRTT, estimatedDeviation, timeoutNs}
-        throw new UnsupportedOperationException("data transfer not yet implemented");
+        long estimatedRTT       = ewmaState[0];
+        long estimatedDeviation = ewmaState[1];
+        long timeoutNs          = ewmaState[2];
+
+        byte[] fileData = Files.readAllBytes(Paths.get(filename));
+
+        int base = 1, nextSeq = 1;
+        TreeMap<Integer, TCPSegment> unAcked          = new TreeMap<>();
+        HashMap<Integer, Integer>   retryCount        = new HashMap<>();
+        HashSet<Integer>            retransmittedSeqs = new HashSet<>();
+        int lastAckNum = 1, dupAckCount = 0;
+        boolean eof = (fileData.length == 0);
+
+        while (!eof || !unAcked.isEmpty()) {
+
+            while (unAcked.size() < sws && !eof) {
+                int offset = nextSeq - 1;
+                if (offset >= fileData.length) { eof = true; break; }
+                int chunkLen = Math.min(mtu, fileData.length - offset);
+                byte[] chunk = Arrays.copyOfRange(fileData, offset, offset + chunkLen);
+
+                TCPSegment seg = new TCPSegment();
+                seg.seqNum    = nextSeq;
+                seg.ackNum    = 1;
+                seg.ackFlag   = true;
+                seg.data      = chunk;
+                seg.dataLen   = chunkLen;
+                seg.timestamp = System.nanoTime();
+
+                sendSegment(socket, seg, remoteAddr, remotePort);
+                unAcked.put(nextSeq, seg);
+                retryCount.put(nextSeq, 0);
+                dataBytes += chunkLen;
+                nextSeq   += chunkLen;
+                if (nextSeq - 1 >= fileData.length) eof = true;
+            }
+
+            if (unAcked.isEmpty()) continue;
+
+            socket.setSoTimeout(Math.max(1, (int) (timeoutNs / 1_000_000)));
+            try {
+                byte[] buf = new byte[24 + mtu];
+                DatagramPacket dp = new DatagramPacket(buf, buf.length);
+                socket.receive(dp);
+                byte[] recv = Arrays.copyOf(dp.getData(), dp.getLength());
+                if (!checkCheckSum(recv)) { checksumDiscards++; continue; }
+
+                TCPSegment seg = TCPSegment.decompose(recv);
+                logPacket("rcv", seg.synFlag, seg.ackFlag, seg.finFlag,
+                        seg.dataLen, seg.seqNum, seg.ackNum, startTime);
+
+                int ackNum = seg.ackNum;
+
+                if (ackNum == lastAckNum) {
+                    dupAckCount++;
+                    dupAcks++;
+                    if (dupAckCount == 3) {
+                        TCPSegment toRetransmit = unAcked.get(base);
+                        if (toRetransmit != null) {
+                            toRetransmit.timestamp = System.nanoTime();
+                            sendSegment(socket, toRetransmit, remoteAddr, remotePort);
+                            retransmissions++;
+                            retransmittedSeqs.add(base);
+                        }
+                        dupAckCount = 0;
+                    }
+                } else if (ackNum > lastAckNum) {
+                    boolean wasRetransmitted = false;
+                    for (Integer seq : new ArrayList<>(unAcked.headMap(ackNum).keySet())) {
+                        if (retransmittedSeqs.remove(seq)) wasRetransmitted = true;
+                        unAcked.remove(seq);
+                        retryCount.remove(seq);
+                    }
+                    base        = ackNum;
+                    lastAckNum  = ackNum;
+                    dupAckCount = 0;
+
+                    if (!wasRetransmitted) {
+                        long sampledRTT       = System.nanoTime() - seg.timestamp;
+                        long sampledDeviation = Math.abs(sampledRTT - estimatedRTT);
+                        estimatedRTT        = (long) (0.875 * estimatedRTT       + 0.125 * sampledRTT);
+                        estimatedDeviation  = (long) (0.75  * estimatedDeviation + 0.25  * sampledDeviation);
+                        timeoutNs           = estimatedRTT + 4 * estimatedDeviation;
+                        socket.setSoTimeout(Math.max(1, (int) (timeoutNs / 1_000_000)));
+                    }
+                }
+
+            } catch (SocketTimeoutException e) {
+                if (unAcked.isEmpty()) continue;
+                retryCount.merge(base, 1, Integer::sum);
+                if (retryCount.get(base) > 16) {
+                    System.err.println("Retransmit limit exceeded for seq " + base);
+                    socket.close();
+                    System.exit(1);
+                }
+                TCPSegment toRetransmit = unAcked.get(base);
+                toRetransmit.timestamp = System.nanoTime();
+                sendSegment(socket, toRetransmit, remoteAddr, remotePort);
+                retransmissions++;
+                retransmittedSeqs.add(base);
+            }
+        }
+
+        throw new UnsupportedOperationException("FIN teardown not yet implemented");
     }
 
     static void runReceiver(DatagramSocket socket, String filename,
@@ -208,7 +298,6 @@ public class TCPend {
         }
 
         boolean senderMode = (remoteIP != null);
-
         if (localPort < 0 || filename == null || mtu < 0 || sws < 0) {
             System.err.println("Missing required arguments.");
             printUsage();
@@ -258,8 +347,8 @@ public class TCPend {
             buffer.putLong(timestamp);
             int len = (dataLen << 3) | (synFlag ? 4 : 0) | (finFlag ? 2 : 0) | (ackFlag ? 1 : 0);
             buffer.putInt(len);
-            buffer.putShort((short) 0); // bytes 20-21: padding
-            buffer.putShort((short) 0); // bytes 22-23: checksum placeholder
+            buffer.putShort((short) 0);
+            buffer.putShort((short) 0);
             buffer.put(payload);
             byte[] bytes = buffer.array();
             short cs = getChecksum(bytes);
@@ -279,7 +368,7 @@ public class TCPend {
             s.synFlag = (len & 4) != 0;
             s.finFlag = (len & 2) != 0;
             s.ackFlag = (len & 1) != 0;
-            buffer.getShort(); // skip padding bytes 20-21
+            buffer.getShort();
             s.checksum = buffer.getShort();
             s.data = new byte[s.dataLen];
             if (s.dataLen > 0) buffer.get(s.data);
